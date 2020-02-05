@@ -7,48 +7,9 @@
   https://AlexGyver.ru/
 */
 
-/*
-  Версия 1.5.1
-  - Оптимизировано обращение к серверу времени (нет подвисаний при отсутствии интернета)
-  - Оптимизация под пины NodeMCU
-
-  Версия 1.5.2
-  - Исправлен незначительный баг с таймером
-  - Исправлено падение по WDT при выводе IP
-  - Исправлен баг с переназначением времени будильника
-  - Исправлено переключение с первого на последний режимы
-  - Приложение автоматически получает настройки с кнопки
-  - Бегущая строка с текущим временем во время рассвета
-
-  Версия 1.5.3
-  - Увеличена плавность рассвета
-  - Поправлен баг с отображением времени рассвета
-
-  Версия 1.5.4
-  - Поправлены глюки во время рассвета
-  
-  Версия 1.5.5
-  - Поправлено невыключение света во время рассвета
-
-*/
-
-// Ссылка для менеджера плат:
-// http://arduino.esp8266.com/stable/package_esp8266com_index.json
-
-// Для WEMOS выбираем плату LOLIN(WEMOS) D1 R2 & mini
-// Для NodeMCU выбираем NodeMCU 1.0 (ESP-12E Module)
-
 // ============= НАСТРОЙКИ =============
 // -------- КНОПКА -------
 #define USE_BUTTON 1    // 1 - использовать кнопку, 0 - нет
-
-// -------- ВРЕМЯ -------
-#define GMT 3              // смещение (москва 3)
-#define NTP_ADDRESS  "europe.pool.ntp.org"    // сервер времени
-
-// -------- РАССВЕТ -------
-#define DAWN_BRIGHT 200       // макс. яркость рассвета
-#define DAWN_TIMEOUT 1        // сколько рассвет светит после времени будильника, минут
 
 // ---------- МАТРИЦА ---------
 #define BRIGHTNESS 40         // стандартная маскимальная яркость (0-255)
@@ -61,7 +22,7 @@
 
 #define MATRIX_TYPE 0         // тип матрицы: 0 - зигзаг, 1 - параллельная
 #define CONNECTION_ANGLE 0    // угол подключения: 0 - левый нижний, 1 - левый верхний, 2 - правый верхний, 3 - правый нижний
-#define STRIP_DIRECTION 0     // направление ленты из угла: 0 - вправо, 1 - вверх, 2 - влево, 3 - вниз
+#define STRIP_DIRECTION 1     // направление ленты из угла: 0 - вправо, 1 - вверх, 2 - влево, 3 - вниз
 // при неправильной настройке матрицы вы получите предупреждение "Wrong matrix parameters! Set to default"
 // шпаргалка по настройке матрицы здесь! https://alexgyver.ru/matrix_guide/
 
@@ -81,8 +42,8 @@ byte IP_AP[] = {192, 168, 4, 66};   // статический IP точки до
 #define AC_PASS "12345678"
 
 // ============= ДЛЯ РАЗРАБОТЧИКОВ =============
-#define LED_PIN D4             // пин ленты
-#define BTN_PIN D2
+#define LED_PIN 14             // пин ленты
+#define BTN_PIN 16
 #define MODE_AMOUNT 18
 
 #define NUM_LEDS WIDTH * HEIGHT
@@ -91,28 +52,21 @@ byte IP_AP[] = {192, 168, 4, 66};   // статический IP точки до
 #define FASTLED_INTERRUPT_RETRY_COUNT 0
 #define FASTLED_ALLOW_INTERRUPTS 0
 #define FASTLED_ESP8266_RAW_PIN_ORDER
-#define NTP_INTERVAL 60 * 1000    // обновление (1 минута)
 
-#include "timer2Minim.h"
 #include <FastLED.h>
 #include <ESP8266WiFi.h>
-#include <DNSServer.h>
 #include <ESP8266WebServer.h>
 #include <WiFiManager.h>
 #include <WiFiUdp.h>
 #include <EEPROM.h>
-#include <NTPClient.h>
 #include <GyverButton.h>
 #include "fonts.h"
+#include <ArduinoOTA.h>
 
 // ------------------- ТИПЫ --------------------
 CRGB leds[NUM_LEDS];
 WiFiServer server(80);
 WiFiUDP Udp;
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, NTP_ADDRESS, GMT * 3600, NTP_INTERVAL);
-timerMinim timeTimer(1000);
-timerMinim timeStrTimer(120);
 GButton touch(BTN_PIN, LOW_PULL, NORM_OPEN);
 
 // ----------------- ПЕРЕМЕННЫЕ ------------------
@@ -125,24 +79,15 @@ char packetBuffer[UDP_TX_PACKET_MAX_SIZE + 1]; //buffer to hold incoming packet
 String inputBuffer;
 static const byte maxDim = max(WIDTH, HEIGHT);
 struct {
-  byte brightness = 50;
   byte speed = 30;
   byte scale = 40;
 } modes[MODE_AMOUNT];
 
-struct {
-  boolean state = false;
-  int time = 0;
-} alarm[7];
-
-const byte dawnOffsets[] = {5, 10, 15, 20, 25, 30, 40, 50, 60};
-byte dawnMode;
-boolean dawnFlag = false;
-float thisTime;
-boolean manualOff = false;
 boolean sendSettings_flag = false;
 
 int8_t currentMode = 0;
+int8_t currentBrightness = BRIGHTNESS;
+
 boolean loadingFlag = true;
 boolean ONflag = true;
 uint32_t eepromTimer;
@@ -153,9 +98,6 @@ boolean settChanged = false;
 
 unsigned char matrixValue[8][16];
 String lampIP = "";
-byte hrs, mins, secs;
-byte days;
-String timeStr = "00:00";
 
 void setup() {
   ESP.wdtDisable();
@@ -200,7 +142,7 @@ void setup() {
     /*WiFi.config(IPAddress(IP_STA[0], IP_STA[1], IP_STA[2], IP_STA[3]),
                 IPAddress(192, 168, 1, 1),
                 IPAddress(255, 255, 255, 0));*/
-    Serial.print("Connected! IP address: ");
+    Serial.print("\nConnected! IP address: ");
     Serial.println(WiFi.localIP());
     lampIP = WiFi.localIP().toString();
   }
@@ -208,86 +150,61 @@ void setup() {
   Udp.begin(localPort);
 
   // EEPROM
-  EEPROM.begin(202);
-  delay(50);
-  if (EEPROM.read(198) != 20) {   // первый запуск
-    EEPROM.write(198, 20);
-    EEPROM.commit();
+  initEEPROM();
 
-    for (byte i = 0; i < MODE_AMOUNT; i++) {
-      EEPROM.put(3 * i + 40, modes[i]);
-      EEPROM.commit();
-    }
-    for (byte i = 0; i < 7; i++) {
-      EEPROM.write(5 * i, alarm[i].state);   // рассвет
-      eeWriteInt(5 * i + 1, alarm[i].time);
-      EEPROM.commit();
-    }
-    EEPROM.write(199, 0);   // рассвет
-    EEPROM.write(200, 0);   // режим
-    EEPROM.commit();
-  }
-  for (byte i = 0; i < MODE_AMOUNT; i++) {
-    EEPROM.get(3 * i + 40, modes[i]);
-  }
-  for (byte i = 0; i < 7; i++) {
-    alarm[i].state = EEPROM.read(5 * i);
-    alarm[i].time = eeGetInt(5 * i + 1);
-  }
-  dawnMode = EEPROM.read(199);
-  currentMode = (int8_t)EEPROM.read(200);
+  FastLED.setBrightness(currentBrightness);
+
+  Serial.print("currentMode = ");
+  Serial.println(String(currentMode));
 
   // отправляем настройки
   sendSettings();
 
-  timeClient.begin();
   memset(matrixValue, 0, sizeof(matrixValue));
 
   randomSeed(micros());
 
-  // получаем время
-  byte count = 0;
-  while (count < 5) {
-    if (timeClient.update()) {
-      hrs = timeClient.getHours();
-      mins = timeClient.getMinutes();
-      secs = timeClient.getSeconds();
-      days = timeClient.getDay();
-      break;
+  // настройка ота обновления
+  ArduinoOTA.setHostname("ESPLamp");
+  ArduinoOTA.setRebootOnSuccess(true);
+  
+  ArduinoOTA.onStart([]() {
+    Serial.println("Start updating ");
+    currentMode = 16;
+    effectsTick();
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    effectsTick();
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) {
+      Serial.println("Auth Failed");
+    } else if (error == OTA_BEGIN_ERROR) {
+      Serial.println("Begin Failed");
+    } else if (error == OTA_CONNECT_ERROR) {
+      Serial.println("Connect Failed");
+    } else if (error == OTA_RECEIVE_ERROR) {
+      Serial.println("Receive Failed");
+    } else if (error == OTA_END_ERROR) {
+      Serial.println("End Failed");
     }
-    count++;
-    delay(500);
-  }
-  updTime();
+  });
+  ArduinoOTA.begin();
 }
 
 void loop() {
+  ArduinoOTA.handle();
   parseUDP();
   effectsTick();
   eepromTick();
-  timeTick();
 #if (USE_BUTTON == 1)
   buttonTick();
 #endif
   ESP.wdtFeed();   // пнуть собаку
   yield();  // ещё раз пнуть собаку
-}
-
-void eeWriteInt(int pos, int val) {
-  byte* p = (byte*) &val;
-  EEPROM.write(pos, *p);
-  EEPROM.write(pos + 1, *(p + 1));
-  EEPROM.write(pos + 2, *(p + 2));
-  EEPROM.write(pos + 3, *(p + 3));
-  EEPROM.commit();
-}
-
-int eeGetInt(int pos) {
-  int val;
-  byte* p = (byte*) &val;
-  *p        = EEPROM.read(pos);
-  *(p + 1)  = EEPROM.read(pos + 1);
-  *(p + 2)  = EEPROM.read(pos + 2);
-  *(p + 3)  = EEPROM.read(pos + 3);
-  return val;
 }
